@@ -1,0 +1,190 @@
+## 初始化函数，设定要操作的股票、基准等等
+def initialize(context):
+    # 设定沪深300作为基准
+    set_benchmark('000300.XSHG')
+    # True为开启动态复权模式，使用真实价格交易
+    set_option('use_real_price', True) 
+    # 设定成交量比例
+    set_option('order_volume_ratio', 1)
+    # 股票类交易手续费是：买入时佣金万分之三，卖出时佣金万分之三加千分之一印花税, 每笔交易佣金最低扣5块钱
+    set_order_cost(OrderCost(open_tax=0, close_tax=0.001, \
+                             open_commission=0.0003, close_commission=0.0003,\
+                             close_today_commission=0, min_commission=5), type='stock')
+    # 持仓数量
+    g.stocknum = 10
+    # 交易日计时器
+    g.days = 0 
+    # 调仓频率
+    g.refresh_rate = 5
+    # 调整止损阈值
+    g.max_drawdown_threshold = 0.10
+    # 记录投资组合最高价值
+    g.portfolio_high = 0
+    # 记录需要清仓的股票列表（新增）
+    g.stocks_to_sell = []
+    # 运行函数
+    run_daily(trade, 'every_bar')
+
+## 选出小市值股票 - 市值在5%到10%分位数之间的最小10支
+def check_stocks(context):
+    # 先查询所有A股股票的市值
+    q_all = query(
+        valuation.code,
+        valuation.market_cap
+    )
+    df_all = get_fundamentals(q_all)
+    
+    # 计算市值的5%分位数和10%分位数
+    market_caps = df_all['market_cap']
+    p5 = market_caps.quantile(0.05)  # 5%分位数
+    p10 = market_caps.quantile(0.10)  # 10%分位数
+    
+    # 筛选市值在5%分位数到10%分位数之间的股票
+    q_filtered = query(
+        valuation.code,
+        valuation.market_cap
+    ).filter(
+        valuation.market_cap.between(p5, p10)
+    ).order_by(
+        valuation.market_cap.asc()  # 按市值升序排序
+    )
+    
+    df_filtered = get_fundamentals(q_filtered)
+    buylist = list(df_filtered['code'])
+    
+    # 过滤停牌股票
+    buylist = filter_paused_stock(buylist)
+    
+    # 返回市值最小的10支股票
+    return buylist[:g.stocknum]
+
+## 计算当前回撤
+def calculate_drawdown(context):
+    # 获取当前投资组合总价值
+    current_value = context.portfolio.total_value
+    
+    # 更新投资组合最高价值
+    if current_value > g.portfolio_high:
+        g.portfolio_high = current_value
+    
+    # 计算回撤（从最高点下跌的百分比）
+    if g.portfolio_high > 0:
+        drawdown = (g.portfolio_high - current_value) / g.portfolio_high
+    else:
+        drawdown = 0
+    
+    return drawdown
+
+## 简化的止损检查 - 只检查不回传状态
+def should_stop_loss(context):
+    # 如果没有持仓，不需要止损
+    if len(context.portfolio.positions) == 0 and len(g.stocks_to_sell) == 0:
+        return False
+    
+    # 计算当前回撤
+    current_drawdown = calculate_drawdown(context)
+    
+    # 如果回撤超过阈值，触发止损
+    if current_drawdown >= g.max_drawdown_threshold:
+        log.info("触发止损，回撤达到: {:.1%}".format(current_drawdown))
+        return True
+    
+    return False
+
+## 尝试清仓股票
+def try_sell_stocks(context):
+    # 获取当前数据
+    current_data = get_current_data()
+    
+    # 记录成功清仓的股票
+    sold_stocks = []
+    
+    # 尝试清仓g.stocks_to_sell列表中的股票
+    for stock in g.stocks_to_sell[:]:  # 使用切片创建副本，避免在迭代中修改列表
+        # 检查股票是否仍可交易
+        if stock in context.portfolio.positions and context.portfolio.positions[stock].closeable_amount > 0:
+            # 检查股票是否停牌
+            if not current_data[stock].paused:
+                try:
+                    # 尝试清仓
+                    order_target_value(stock, 0)
+                    log.info(f"尝试清仓股票: {stock}")
+                    
+                    # 检查是否成功清仓（简化检查，实际中可能需要更复杂的逻辑）
+                    # 这里假设订单能立即成交，实际中可能需要延迟检查
+                    
+                except Exception as e:
+                    log.warn(f"清仓股票 {stock} 时出错: {str(e)}")
+            else:
+                log.info(f"股票 {stock} 停牌，无法清仓")
+        else:
+            # 股票已清仓或无可卖数量，从待清仓列表中移除
+            sold_stocks.append(stock)
+    
+    # 更新待清仓列表
+    for stock in sold_stocks:
+        if stock in g.stocks_to_sell:
+            g.stocks_to_sell.remove(stock)
+            log.info(f"股票 {stock} 已从待清仓列表中移除")
+
+## 交易函数 - 重新设计逻辑
+def trade(context):
+    
+    # 每天递增计数器
+    g.days += 1
+    
+    # 检查是否触发止损（只在有持仓时检查）
+    if should_stop_loss(context):
+        # 将当前持仓加入待清仓列表
+        current_holdings = list(context.portfolio.positions.keys())
+        for stock in current_holdings:
+            if stock not in g.stocks_to_sell:
+                g.stocks_to_sell.append(stock)
+                log.info(f"将股票 {stock} 加入待清仓列表")
+                
+    # 每天尝试清仓待清仓列表中的股票（新增）
+    if len(g.stocks_to_sell) > 0:
+        log.info(f"尝试清仓以下股票: {g.stocks_to_sell}")
+        try_sell_stocks(context)
+        
+        # 重置最高价值
+        g.portfolio_high = 0
+        
+
+    
+    # 调仓日逻辑（独立于止损状态）
+    if g.days % g.refresh_rate == 0:
+        # 重置计数器
+        g.days = 0
+        
+        # 记录是否有实际买入
+        has_bought = False
+        
+        
+        # 选股
+        stock_list = check_stocks(context)
+        
+        # 计算可用仓位（总仓位减去待清仓的股票数量）
+        available_slots = g.stocknum - len(g.stocks_to_sell)
+        
+        # 计算每只股票的投资金额
+        if len(stock_list) > 0 and available_slots > 0:
+            cash_per_stock = context.portfolio.cash / min(len(stock_list), available_slots)
+            
+            # 买入新选出的股票
+            for stock in stock_list:
+                # 检查当前持仓数量（包括待清仓的股票）
+                current_holdings_count = len(context.portfolio.positions.keys())
+                if current_holdings_count < g.stocknum and stock not in g.stocks_to_sell:
+                    order_value(stock, cash_per_stock)
+                    log.info(f"买入股票: {stock}")
+                    has_bought = True
+            
+        if has_bought:
+            # 重置最高价值
+            g.portfolio_high = context.portfolio.total_value
+
+# 过滤停牌股票
+def filter_paused_stock(stock_list):
+    current_data = get_current_data()
+    return [stock for stock in stock_list if not current_data[stock].paused]
